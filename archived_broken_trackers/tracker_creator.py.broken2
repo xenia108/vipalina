@@ -1,0 +1,988 @@
+"""
+Упрощенное создание трекеров через копирование шаблона.
+Решает проблему квоты Google Drive.
+
+ВАЖНО: Использует копирование существующего шаблона вместо создания нового файла!
+"""
+
+import gspread
+from googleapiclient.discovery import build
+from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.credentials import Credentials
+import logging
+import os
+from typing import Dict, Any, Optional
+from course_config_v2 import CourseConfig
+from config import TRACKER_OWNER_EMAIL, TRACKER_FOLDER_ID, USER_OAUTH_TOKEN_PATH
+
+logger = logging.getLogger('vipalina_telethon')
+
+
+class TrackerCreator:
+    """
+    Создает трекеры студентов копированием шаблона.
+    
+    Преимущества:
+    - ✅ Не требует квоты на создание файлов
+    - ✅ Быстрое создание
+    - ✅ Сохраняет форматирование шаблона
+    - ✅ Формулы работают сразу
+    """
+    
+    # ID шаблона трекера
+    TEMPLATE_ID = '1gH1Sd7BCeUFBqufXUy63nVjWPcNmGNq312iL8-_Y_rQ'
+    
+    def __init__(self, credentials_path: str = 'vipalina_google_credentials.json'):
+        """Инициализация с путем к credentials"""
+        self.credentials_path = credentials_path
+        self.drive_service = None
+        self.sheets_client = None
+        self.auth_mode = 'service_account'
+        self._authorize()
+    
+    def _authorize(self):
+        """Авторизация в Google Sheets и Drive API (User OAuth при наличии токена, иначе Service Account)"""
+        try:
+            scope = [
+                'https://www.googleapis.com/auth/drive',
+                'https://www.googleapis.com/auth/spreadsheets'
+            formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            creds = None
+
+            # Пытаемся авторизоваться через пользовательский токен (vipzerocoder)
+            try:
+                if USER_OAUTH_TOKEN_PATH and os.path.exists(USER_OAUTH_TOKEN_PATH):
+                    creds = Credentials.from_authorized_user_file(USER_OAUTH_TOKEN_PATH, scope)
+                    self.auth_mode = 'user_oauth'
+                    logger.info("✅ Авторизация через User OAuth (Drive + Sheets)")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось авторизоваться через User OAuth: {e}")
+                creds = None
+
+            # Если пользовательская авторизация недоступна — используем сервисный аккаунт
+            if creds is None:
+                creds = ServiceAccountCredentials.from_json_keyfile_name(
+                    self.credentials_path, scope
+                )
+                self.auth_mode = 'service_account'
+                logger.info("✅ Авторизация через Service Account (Drive + Sheets)")
+            
+            # Drive API для копирования файлов
+            self.drive_service = build('drive', 'v3', credentials=creds)
+            
+            # Sheets API для работы с данными
+            self.sheets_client = gspread.authorize(creds)
+            
+            logger.info("✅ Авторизация успешна (Drive + Sheets)")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка авторизации: {e}")
+            raise
+    
+    def create_tracker(
+        self,
+        student_name: str,
+        course_tag: str,
+        manager_name: str,
+        getcourse_id: str,
+        parent_folder_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Создает трекер студента копированием шаблона.
+        
+        Args:
+            student_name: Имя студента (например, "Иван Иванов")
+            course_tag: Тег курса из GetCourse (например, "[python-ai-2.0] Тариф \"VIP\"")
+            manager_name: Имя VIP-менеджера
+            getcourse_id: ID из GetCourse
+            parent_folder_id: ID папки на Google Drive (опционально)
+        
+        Returns:
+            Dict с данными созданного трекера:
+            {
+                'spreadsheet_id': str,
+                'url': str,
+                'title': str,
+                'course_params': dict
+            }
+        """
+        try:
+            # 1. Получаем параметры курса из маппинга
+            course_params = CourseConfig.get_course_params(course_tag)
+            tracker_name = CourseConfig.get_tracker_course_name(course_tag)
+            
+            logger.info(f"📚 Создание трекера для {student_name}")
+            logger.info(f"   Курс: {tracker_name}")
+            logger.info(f"   Уроков: {course_params['lesson_count']}")
+            logger.info(f"   Доступ: {course_params['access_days']} дней")
+            logger.info(f"   VIP поддержка: {course_params['vip_support_days']} дней")
+            
+            # 2. Копируем шаблон через Drive API
+            new_title = f"{student_name} - {tracker_name}"
+            new_tracker_id = self._copy_template(new_title, parent_folder_id)
+            
+            logger.info(f"✅ Шаблон скопирован: {new_tracker_id}")
+            
+            # 3. Передаём ownership на vipzerocoder@gmail.com (чтобы файл занимал место на их диске)
+            self._transfer_ownership(new_tracker_id)
+            
+            # 4. Открываем скопированный трекер
+            tracker = self.sheets_client.open_by_key(new_tracker_id)
+            
+            # 5. Копируем данные курса в лист "⚙️ Конфигурация" (ДО удаления листов)
+            self._copy_course_data_to_config(tracker, tracker_name, course_params)
+            
+            # 6. Удаляем внутренние листы
+            self._remove_internal_sheets(tracker)
+            
+            # 6.1. Скрываем лист "⚙️ Конфигурация" (нужен для формул, но не для просмотра)
+            self._hide_config_sheet(tracker)
+            
+            # 7. Заполняем данными студента
+            self._fill_tracker_data(
+                tracker, 
+                student_name, 
+                tracker_name,
+                manager_name,
+                getcourse_id,
+                course_params
+            )
+            
+            tracker_url = f'https://docs.google.com/spreadsheets/d/{new_tracker_id}'
+            logger.info(f"✅ Трекер создан: {tracker_url}")
+            
+            return {
+                'spreadsheet_id': new_tracker_id,
+                'url': tracker_url,
+                'title': new_title,
+                'course_params': course_params
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания трекера: {e}")
+            raise
+    
+    def _copy_template(self, new_title: str, parent_folder_id: Optional[str] = None) -> str:
+        """
+        Копирует шаблон трекера через Drive API.
+        
+        Args:
+            new_title: Название для нового трекера
+            parent_folder_id: ID папки для размещения (опционально)
+        
+        Returns:
+            ID скопированного файла
+        """
+        try:
+            file_metadata = {'name': new_title}
+            
+            # Если указана папка, добавляем её в метаданные
+            if parent_folder_id:
+                file_metadata['parents'] = [parent_folder_id]
+            
+            # Копируем файл
+            copied_file = self.drive_service.files().copy(
+                fileId=self.TEMPLATE_ID,
+                body=file_metadata,
+                supportsAllDrives=True
+            ).execute()
+            
+            return copied_file['id']
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка копирования шаблона: {e}")
+            raise
+    
+    def _transfer_ownership(self, file_id: str) -> bool:
+        """
+        Передаёт ownership файла на vipzerocoder@gmail.com.
+        Это позволяет избежать использования квоты Service Account.
+        
+        Args:
+            file_id: ID файла для передачи ownership
+        
+        Returns:
+            True если успешно
+        """
+        try:
+            # Если авторизация от имени пользователя — передача владельца не требуется
+            if getattr(self, 'auth_mode', 'service_account') == 'user_oauth':
+                logger.info("ℹ️ Пропускаем передачу владельца: файл уже принадлежит пользователю")
+                return True
+            
+            logger.info(f"📤 Передача ownership трекера на {TRACKER_OWNER_EMAIL}...")
+            
+            # Шаг 1: Получаем текущих родителей (папки) файла
+            file_info = self.drive_service.files().get(
+                fileId=file_id,
+                fields='parents'
+            ).execute()
+            
+            current_parents = file_info.get('parents', [])
+            logger.info(f"📁 Текущие папки файла: {current_parents}")
+            
+            # Шаг 2: Создаём разрешение с ролью owner и включаем transferOwnership
+            permission = {
+                'type': 'user',
+                'role': 'owner',
+                'emailAddress': TRACKER_OWNER_EMAIL
+            }
+            
+            self.drive_service.permissions().create(
+                fileId=file_id,
+                body=permission,
+                transferOwnership=True,  # Ключевой параметр!
+                sendNotificationEmail=False  # Не отправляем уведомление
+            ).execute()
+            
+            logger.info(f"✅ Ownership передан на {TRACKER_OWNER_EMAIL}")
+            
+            # Шаг 3: Удаляем файл из старых папок (чтобы не занимал место на Service Account)
+            # После передачи ownership файл остаётся в папке назначения (TRACKER_FOLDER_ID)
+            if current_parents:
+                # Получаем информацию о текущих папках после передачи
+                updated_file = self.drive_service.files().get(
+                    fileId=file_id,
+                    fields='parents'
+                ).execute()
+                
+                updated_parents = updated_file.get('parents', [])
+                
+                # Если файл всё ещё в нескольких папках, очищаем старые
+                if len(updated_parents) > 1 or (updated_parents and updated_parents[0] != TRACKER_FOLDER_ID):
+                    logger.info(f"🧹 Очистка файла из старых папок...")
+                    
+                    # Удаляем из всех папок кроме целевой
+                    parents_to_remove = [p for p in updated_parents if p != TRACKER_FOLDER_ID]
+                    
+                    if parents_to_remove:
+                        self.drive_service.files().update(
+                            fileId=file_id,
+                            removeParents=','.join(parents_to_remove),
+                            fields='id, parents'
+                        ).execute()
+                        
+                        logger.info(f"✅ Файл удалён из {len(parents_to_remove)} старых папок")
+            
+            logger.info(f"💾 Теперь файл занимает место на диске {TRACKER_OWNER_EMAIL}, а не Service Account")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка передачи ownership: {e}")
+            logger.warning("⚠️ Файл создан, но остался на диске Service Account")
+            # Не пробрасываем ошибку дальше - файл всё равно создан
+            return False
+    
+    def _fill_tracker_data(
+        self,
+        tracker,
+        student_name: str,
+        course_name: str,
+        manager_name: str,
+        getcourse_id: str,
+        params: Dict[str, Any]
+    ):
+        """
+        Заполняет данными студента в скопированном трекере.
+        
+        Обновляет:
+        - Информацию о студенте (имя, курс, менеджер, ID)
+        - Параметры курса (доступ, поддержка)
+        - Помесячный прогресс
+        """
+        try:
+            # Ищем лист "📈 Статистика" или первый лист
+            try:
+                main_sheet = tracker.worksheet("📈 Статистика")
+            except:
+                main_sheet = tracker.sheet1
+            
+            logger.info(f"📝 Заполнение данных в лист: {main_sheet.title}")
+            
+            # Обновляем заголовок: B1="Трекер студента", C1=ссылка на конфигурацию, D1=getcourse_id
+            # C1 теперь ссылается на '⚙️ Конфигурация'!A2 для автоматического обновления
+            main_sheet.update([["='⚙️ Конфигурация'!A2"]], 'C1', value_input_option='USER_ENTERED')
+            main_sheet.update([[getcourse_id]], 'D1', value_input_option='USER_ENTERED')
+            
+            # Добавляем текущую дату в G1 (для использования в формулах)
+            main_sheet.update([['=TODAY()']], 'G1', value_input_option='USER_ENTERED')
+            logger.info("✅ Добавлена формула =TODAY() в G1")
+            
+            # Обновляем формулы для расчета сроков (если нужно)
+            # В шаблоне уже должны быть формулы, но можем обновить параметры
+            self._update_course_parameters(main_sheet, params)
+            
+            # Обновляем формулы в помесячном прогрессе
+            self._update_monthly_progress_formulas(main_sheet, params)
+            
+            # Настраиваем лист "📚 Все уроки курса" с формулой IMPORTRANGE
+            self._setup_lessons_sheet(tracker, params)
+            
+            logger.info("✅ Данные студента заполнены")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка заполнения данных: {e}")
+            raise
+    
+    def _copy_course_data_to_config(self, tracker, course_name: str, params: Dict[str, Any]):
+        """
+        Копирует данные курса в лист "⚙️ Конфигурация".
+        Создает dropdown со списком всех курсов для возможности изменения.
+        """
+        try:
+            logger.info("⚠️ Настраиваем лист 'Конфигурация' с dropdown...")
+            
+            # Ищем лист Конфигурация (с разными вариантами названия)
+            config_sheet = None
+            for variant in ["⚙️ Конфигурация", "Конфигурация", "Configuration"]:
+                try:
+                    config_sheet = tracker.worksheet(variant)
+                    logger.info(f"✅ Найден лист: '{variant}'")
+                    break
+                except:
+                    continue
+            
+            if config_sheet is None:
+                # Поиск по всем листам
+                for ws in tracker.worksheets():
+                    if "Конфиг" in ws.title or "config" in ws.title.lower():
+                        config_sheet = ws
+                        logger.info(f"✅ Найден лист: '{ws.title}'")
+                        break
+            
+            if config_sheet is None:
+                raise Exception("Не найден лист Конфигурации")
+            
+            # 1. Заголовки (строка 1)
+            headers = [[
+                "Название курса",
+                "Количество уроков",
+                "Доступ (мес)",
+                "Куратор (мес)",
+                "VIP (мес)",
+                "Тег курса (ГАНТ)"
+            formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            config_sheet.update(headers, 'A1:F1', value_input_option='USER_ENTERED')
+            
+            # 2. Текущий курс (строка 2) - пока только название, остальное через VLOOKUP
+            gant_tag = params.get('gant_sheet', '')
+            current_course = [[
+                course_name,
+                params['lesson_count'],
+                params['access_days'] // 30,
+                params['curator_support_days'] // 30,
+                params['vip_support_days'] // 30,
+                gant_tag
+            formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            config_sheet.update(current_course, 'A2:F2', value_input_option='USER_ENTERED')
+            
+            # 3. Строка 3 - пустая (разделитель)
+            
+            # 4. Строка 4 - заголовок для скрытого списка
+            hidden_header = [["📋 Список всех курсов (для dropdown):", "", "", "", "", ""]]
+            config_sheet.update(hidden_header, 'A4:F4', value_input_option='USER_ENTERED')
+            
+            # 5. Все курсы (строки 5+) - скрытый список для VLOOKUP
+            all_courses = []
+            for tag, data in CourseConfig.COURSE_MAPPING.items():
+                all_courses.append([
+                    data['internal_name'],  # A: Название
+                    data.get('lesson_count', 50),  # B: Уроков
+                    data.get('access_days', 360) // 30,  # C: Доступ (мес)
+                    data.get('curator_support_days', 180) // 30,  # D: Куратор (мес)
+                    data.get('vip_support_days', 360) // 30,  # E: VIP (мес)
+                    data.get('gant_sheet', '')  # F: ГАНТ тег
+                formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            
+            # Сортируем курсы по названию для удобства
+            all_courses.sort(key=lambda x: x[0])
+            
+            config_sheet.update(all_courses, 'A5', value_input_option='USER_ENTERED')
+            logger.info(f"✅ Добавлено {len(all_courses)} курсов в скрытый список")
+            
+            # 6. Создаем dropdown для A2
+            sheet_id = config_sheet.id
+            end_row = 5 + len(all_courses)
+            
+            request = {
+                "requests": [
+                    {
+                        "setDataValidation": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,  # Строка 2 (0-based)
+                                "endRowIndex": 2,
+                                "startColumnIndex": 0,  # Столбец A
+                                "endColumnIndex": 1
+                            },
+                            "rule": {
+                                "condition": {
+                                    "type": "ONE_OF_RANGE",
+                                    "values": [{
+                                        "userEnteredValue": f"='{config_sheet.title}'!$A$5:$A${end_row}"
+                                    }]
+                                },
+                                "showCustomUi": True,
+                                "strict": True
+                            }
+                        }
+                    }
+                formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            }
+            tracker.batch_update(request)
+            logger.info("✅ Dropdown создан для ячейки A2")
+            
+            # 7. Заменяем B2-F2 на VLOOKUP формулы (A2 остается как dropdown)
+            vlookup_formulas = [
+                f'=VLOOKUP(A2;A$5:F${end_row};2;FALSE)',  # B2: Уроков
+                f'=VLOOKUP(A2;A$5:F${end_row};3;FALSE)',  # C2: Доступ
+                f'=VLOOKUP(A2;A$5:F${end_row};4;FALSE)',  # D2: Куратор
+                f'=VLOOKUP(A2;A$5:F${end_row};5;FALSE)',  # E2: VIP
+                f'=VLOOKUP(A2;A$5:F${end_row};6;FALSE)'   # F2: ГАНТ
+            formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            config_sheet.update([vlookup_formulas], 'B2:F2', value_input_option='USER_ENTERED')
+            logger.info("✅ VLOOKUP формулы добавлены в B2:F2")
+            
+            # 8. Форматирование: заголовки жирным
+            try:
+                format_requests = {
+                    "requests": [
+                        {
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "startRowIndex": 0,
+                                    "endRowIndex": 1,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 6
+                                },
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "textFormat": {"bold": True},
+                                        "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}
+                                    }
+                                },
+                                "fields": "userEnteredFormat(textFormat,backgroundColor)"
+                            }
+                        },
+                        {
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "startRowIndex": 3,
+                                    "endRowIndex": 4,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 6
+                                },
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "textFormat": {"bold": True, "italic": True},
+                                        "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}
+                                    }
+                                },
+                                "fields": "userEnteredFormat(textFormat,backgroundColor)"
+                            }
+                        }
+                    formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+                }
+                tracker.batch_update(format_requests)
+                logger.info("✅ Форматирование применено")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось применить форматирование: {e}")
+            
+            logger.info(f"✅ Лист Конфигурация настроен с dropdown ({len(all_courses)} курсов)")
+            logger.info(f"📌 ВИП-менеджер может выбрать другой курс в ячейке A2")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка настройки листа Конфигурация: {e}")
+            raise
+    
+    def _update_course_parameters(self, worksheet, params: Dict[str, Any]):
+        """
+        Параметры курса уже настроены в шаблоне через VLOOKUP к листу Конфигурация.
+        Этот метод больше не нужен, так как:
+        - C9, C10, C11 используют VLOOKUP из шаблона
+        - C15 ссылается на '⚙️ Конфигурация'!B2
+        """
+        logger.info("ℹ️ Параметры курса берутся из листа Конфигурация через формулы шаблона")
+        pass
+    
+    def _update_monthly_progress_formulas(self, worksheet, params: Dict[str, Any]):
+        """
+        Создает динамические строки для помесячного прогресса.
+        Количество строк = количество месяцев поддержки куратора (D10).
+        """
+        try:
+            # Находим строку 21 с заголовками (Месяц | Цель | Факт | Прогресс | Статус)
+            all_values = worksheet.get_all_values()
+            
+            progress_header_row = None
+            for i, row in enumerate(all_values):
+                if len(row) >= 5 and row[1] == "Месяц" and row[2] == "Цель" and row[3] == "Факт":
+                    progress_header_row = i + 1  # Это строка 21 (1-based)
+                    break
+            
+            if progress_header_row is None:
+                logger.warning("⚠️ Не найден блок помесячного прогресса (строка 21)")
+                return
+            
+            logger.info(f"📊 Найден заголовок помесячного прогресса в строке {progress_header_row}")
+            
+            # Получаем количество месяцев поддержки куратора
+            curator_months = params['curator_support_days'] // 30
+            logger.info(f"📅 Создаем {curator_months} строк для помесячного прогресса")
+            
+            # Подготавливаем данные для всех месяцев
+            rows_data = []
+            for month in range(1, curator_months + 1):
+                row_num = progress_header_row + month  # Строка 22, 23, 24...
+                
+                # B: Название месяца
+                month_label = f"Месяц {month}"
+                
+                # C: Цель (количество уроков в месяц) - фиксированное значение
+                monthly_goal = 9
+                
+                # D: Факт - формула подсчета выполненных уроков за КАЛЕНДАРНЫЙ месяц
+                # Используем YEAR и MONTH для определения календарного месяца от даты начала
+                # Месяц 1 = тот же месяц что C4, Месяц 2 = следующий месяц и т.д.
+                fact_formula = f'=COUNTIFS(\'📊 Обучение по месяцам\'!F:F;TRUE;\'📊 Обучение по месяцам\'!E:E;">="&DATE(YEAR(EDATE(C4;{month-1}));MONTH(EDATE(C4;{month-1}));1);\'📊 Обучение по месяцам\'!E:E;"<"&DATE(YEAR(EDATE(C4;{month}));MONTH(EDATE(C4;{month}));1))'
+                
+                # E: Процент выполнения
+                progress_formula = f'=IF(C{row_num}=0;0;ROUND(D{row_num}/C{row_num}*100;0))&"%"'
+                
+                # F: Статус (с новыми условиями: >=9 ✅, >6 🆗, >3 ⚠️, иначе ❌)
+                status_formula = f'=IF(D{row_num}>=C{row_num};"✅";IF(D{row_num}>6;"🆗";IF(D{row_num}>3;"⚠️";"❌")))'
+                
+                # G: Визуальный прогресс-бар (поддерживает >100%)
+                visual_formula = f'=REPT("█";MIN(10;ROUND(D{row_num}/C{row_num}*10;0)))&REPT("░";MAX(0;10-ROUND(D{row_num}/C{row_num}*10;0)))&" "&TEXT(D{row_num}/C{row_num};"0%")'
+                
+                rows_data.append([
+                    month_label,      # B: Месяц
+                    monthly_goal,     # C: Цель
+                    fact_formula,     # D: Факт
+                    progress_formula, # E: Прогресс
+                    status_formula,   # F: Статус
+                    visual_formula    # G: Визуальный прогресс
+                formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            
+            # Записываем все строки одним запросом
+            if rows_data:
+                start_row = progress_header_row + 1  # Строка 22
+                end_row = progress_header_row + curator_months
+                range_name = f'B{start_row}:G{end_row}'  # Расширено до столбца G
+                
+                # Логируем первые 3 формулы ПЕРЕД отправкой
+                for i in range(min(3, len(rows_data))):
+                    print(f"DEBUG: Месяц {i+1} перед отправкой: {rows_data[i][2]}")
+                    logger.info(f"🔍 Перед отправкой - Месяц {i+1}: {rows_data[i][2][:80]}...")
+                
+                worksheet.update(rows_data, range_name, value_input_option='USER_ENTERED')
+                logger.info(f"✅ Создано {curator_months} строк помесячного прогресса ({range_name})")
+                
+                # Копируем форматирование из строки 21 на все строки месяцев
+                try:
+                    sheet_id = worksheet.id
+                    
+                    if curator_months >= 1:
+                        copy_format_request = {
+                            "requests": [
+                                {
+                                    "copyPaste": {
+                                        "source": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": 20,  # Строка 21 (0-based)
+                                            "endRowIndex": 21,     # Только строка 21
+                                            "startColumnIndex": 1, # Столбец B
+                                            "endColumnIndex": 7    # До столбца G
+                                        },
+                                        "destination": {
+                                            "sheetId": sheet_id,
+                                            "startRowIndex": start_row - 1,  # Строки 22+ (0-based)
+                                            "endRowIndex": end_row,
+                                            "startColumnIndex": 1,
+                                            "endColumnIndex": 7
+                                        },
+                                        "pasteType": "PASTE_FORMAT"  # Только форматирование
+                                    }
+                                }
+                            formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+                        }
+                        
+                        worksheet.spreadsheet.batch_update(copy_format_request)
+                        logger.info(f"✅ Форматирование скопировано из строки 21 на строки {start_row}-{end_row}")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось скопировать форматирование: {e}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось создать помесячный прогресс: {e}")
+    
+    def _remove_internal_sheets(self, tracker):
+        """
+        Удаляет внутренние листы, которые не должны быть в трекерах студентов.
+        Например, лист "Условия курсов" содержит внутреннюю информацию.
+        """
+        try:
+            # Список листов, которые нужно удалить из трекеров студентов
+            # Лист "⚙️ Конфигурация" НЕ удаляем - он нужен для хранения данных курса
+            internal_sheets = ["Условия курсов"]
+            
+            # Получаем все листы в трекере
+            worksheets = tracker.worksheets()
+            
+            # Удаляем внутренние листы
+            for worksheet in worksheets:
+                if worksheet.title in internal_sheets:
+                    try:
+                        tracker.del_worksheet(worksheet)
+                        logger.info(f"✅ Удален внутренний лист: {worksheet.title}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Не удалось удалить лист {worksheet.title}: {e}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка при удалении внутренних листов: {e}")
+    
+    def _hide_config_sheet(self, tracker):
+        """
+        Скрывает лист "⚙️ Конфигурация" от студента.
+        Лист нужен для работы формул VLOOKUP, но не должен быть виден.
+        """
+        try:
+            # Ищем лист Конфигурация
+            config_sheet = None
+            for variant in ["⚙️ Конфигурация", "Конфигурация", "Configuration"]:
+                try:
+                    config_sheet = tracker.worksheet(variant)
+                    logger.info(f"🔍 Найден лист Конфигурации: '{variant}'")
+                    break
+                except:
+                    continue
+            
+            if config_sheet is None:
+                # Поиск по всем листам
+                for ws in tracker.worksheets():
+                    if "Конфиг" in ws.title or "config" in ws.title.lower():
+                        config_sheet = ws
+                        logger.info(f"🔍 Найден лист Конфигурации: '{ws.title}'")
+                        break
+            
+            if config_sheet is None:
+                logger.warning("⚠️ Не найден лист Конфигурации для скрытия")
+                return
+            
+            # Скрываем лист через batch_update API
+            try:
+                request = {
+                    "requests": [
+                        {
+                            "updateSheetProperties": {
+                                "properties": {
+                                    "sheetId": config_sheet.id,
+                                    "hidden": True
+                                },
+                                "fields": "hidden"
+                            }
+                        }
+                    formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+                }
+                
+                tracker.batch_update(request)
+                logger.info(f"✅ Лист '{config_sheet.title}' скрыт")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось скрыть лист '{config_sheet.title}': {e}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка при скрытии листа Конфигурации: {e}")
+    
+    def _setup_lessons_sheet(self, tracker, params: Dict[str, Any]):
+        """
+        Настраивает лист "📚 Все уроки курса" с формулой IMPORTRANGE.
+        Формула импортирует данные из таблицы ГАНТ по тегу курса.
+        
+        Фильтрация:
+        - Только столбцы A, D, E
+        - Только строки где в столбце A цифра от 1 до 100
+        - Заголовки в строке 1
+        - Данные начинаются со строки 2
+        """
+        try:
+            gant_tag = params.get('gant_sheet', '')
+            
+            if not gant_tag:
+                logger.warning("⚠️ Тег курса для ГАНТ пустой, пропускаем настройку листа '📚 Все уроки курса'")
+                return
+            
+            logger.info(f"📚 Настройка листа 'Все уроки курса' для тега: '{gant_tag}'")
+            
+            # Ищем лист "📚 Все уроки курса"
+            lessons_sheet = None
+            for variant in ["📚 Все уроки курса", " 📚 Все уроки курса", "Все уроки курса"]:
+                try:
+                    lessons_sheet = tracker.worksheet(variant)
+                    logger.info(f"✅ Найден лист: '{variant}'")
+                    break
+                except:
+                    continue
+            
+            if lessons_sheet is None:
+                logger.warning("⚠️ Не найден лист '📚 Все уроки курса'")
+                return
+            
+            # Очищаем лист перед заполнением
+            lessons_sheet.clear()
+            
+            # 1. Добавляем заголовки в первую строку
+            headers = [[
+                "Номер урока",
+                "Название урока",
+                "Формат проведения"
+            formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            lessons_sheet.update(headers, 'A1:C1', value_input_option='USER_ENTERED')
+            logger.info("✅ Заголовки добавлены в строку 1")
+            
+            # 2. ID таблицы ГАНТ
+            gant_spreadsheet_id = '1iJyzqiGGCgrtDnbV-zqjY08P8Vq8HfOElwz7o4S743w'
+            
+            # 3. Создаем формулу IMPORTRANGE с динамической ссылкой на тег из Конфигурации
+            # Фильтруем:
+            # - Только столбцы A, D, E (номер, название, формат)
+            # - Только строки где:
+            #   1. A от 1 до 100 (уроки с номерами)
+            #   ИЛИ 2. E = 'Онлайн' (онлайн-мероприятия)
+            # ВАЖНО: Используем '⚙️ Конфигурация'!F2 для динамического обновления тега при смене курса
+            formula = f'=QUERY(IMPORTRANGE(\"{gant_spreadsheet_id}\";"{gant_tag}!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'\u041e\u043d\u043b\u0430\u0439\u043d\'";0)'
+            
+            # Вставляем формулу в ячейку A2
+            lessons_sheet.update([[formula]], 'A2', value_input_option='USER_ENTERED')
+            logger.info("✅ Формула IMPORTRANGE добавлена в A2")
+            
+            # 4. Настраиваем форматирование
+            # Получаем ID листа для batch_update
+            sheet_id = lessons_sheet.id
+            
+            # Форматирование: черный шрифт, размер 12
+            format_request = {
+                "requests": [
+                    {
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,  # Строка 1 (0-based)
+                                "startColumnIndex": 0,  # Столбец A
+                                "endColumnIndex": 3  # До столбца C включительно
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "textFormat": {
+                                        "foregroundColor": {
+                                            "red": 0,
+                                            "green": 0,
+                                            "blue": 0
+                                        },
+                                        "fontSize": 12
+                                    }
+                                }
+                            },
+                            "fields": "userEnteredFormat.textFormat"
+                        }
+                    }
+                formula = f'=QUERY(IMPORTRANGE("{gant_spreadsheet_id}";"'"&\'⚙️ Конфигурация\'!F2&"'!A:E");"SELECT Col1, Col4, Col5 WHERE (Col1 >= 1 AND Col1 <= 100) OR Col5 = \'Онлайн\'";0)'
+            }
+            
+            tracker.batch_update(format_request)
+            logger.info("✅ Форматирование применено: черный шрифт, размер 12")
+            
+            logger.info(f"✅ Лист '📚 Все уроки курса' настроен")
+            logger.info(f"   Тег: {gant_tag}")
+            logger.info(f"   Формула в A2: {formula[:80]}...")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при настройке листа '📚 Все уроки курса': {e}")
+            # Не пробрасываем ошибку - это не критично
+    
+    def share_tracker(self, spreadsheet_id: str, email: str, role: str = 'writer'):
+        """
+        Открывает доступ к трекеру для пользователя.
+        
+        Args:
+            spreadsheet_id: ID таблицы
+            email: Email пользователя
+            role: Роль доступа ('writer', 'reader', 'owner')
+        """
+        try:
+            permission = {
+                'type': 'user',
+                'role': role,
+                'emailAddress': email
+            }
+            
+            self.drive_service.permissions().create(
+                fileId=spreadsheet_id,
+                body=permission,
+                sendNotificationEmail=False
+            ).execute()
+            
+            logger.info(f"✅ Доступ предоставлен: {email} ({role})")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка предоставления доступа: {e}")
+            raise
+    
+    def move_to_folder(self, spreadsheet_id: str, folder_id: str):
+        """
+        Перемещает трекер в указанную папку.
+        
+        Args:
+            spreadsheet_id: ID таблицы
+            folder_id: ID папки назначения
+        """
+        try:
+            # Получаем текущие родительские папки
+            file = self.drive_service.files().get(
+                fileId=spreadsheet_id,
+                fields='parents'
+            ).execute()
+            
+            previous_parents = ",".join(file.get('parents', []))
+            
+            # Перемещаем в новую папку
+            self.drive_service.files().update(
+                fileId=spreadsheet_id,
+                addParents=folder_id,
+                removeParents=previous_parents,
+                fields='id, parents'
+            ).execute()
+            
+            logger.info(f"✅ Трекер перемещен в папку: {folder_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка перемещения: {e}")
+            raise
+    
+    def add_course_to_classifier(self, getcourse_tag: str, internal_name: str) -> bool:
+        """
+        Добавляет новый курс в лист "Условия курсов" шаблона.
+        
+        Args:
+            getcourse_tag: Тег курса из GetCourse (например, "[test2] Второй тест")
+            internal_name: Внутреннее название (например, "Второй тест, VIP")
+        
+        Returns:
+            True если успешно добавлено
+        """
+        try:
+            logger.info(f"📚 Добавление курса в лист 'Условия курсов': {getcourse_tag} -> {internal_name}")
+            
+            # Открываем шаблон
+            template = self.sheets_client.open_by_key(self.TEMPLATE_ID)
+            
+            # Ищем лист "Условия курсов"
+            try:
+                conditions_sheet = template.worksheet("Условия курсов")
+            except:
+                logger.error("❌ Не найден лист 'Условия курсов' в шаблоне")
+                return False
+            
+            # Проверяем, не существует ли уже такой курс
+            all_values = conditions_sheet.get_all_values()
+            for row in all_values[1:]:  # Пропускаем заголовок
+                if len(row) >= 2 and row[0] == getcourse_tag:
+                    logger.info(f"ℹ️ Курс {getcourse_tag} уже есть в листе 'Условия курсов'")
+                    return True
+            
+            # Добавляем новую строку в конец
+            # Столбец A: Название с ГК, Столбец B: Название для AT, KPI Ultra, трекера и группы в телеграм
+            new_row = [getcourse_tag, internal_name]
+            conditions_sheet.append_row(new_row, value_input_option='RAW')
+            
+            logger.info(f"✅ Курс добавлен в лист 'Условия курсов': {getcourse_tag} | {internal_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при добавлении курса в лист 'Условия курсов': {e}", exc_info=True)
+            return False
+
+
+# Вспомогательная функция для быстрого использования
+
+def create_student_tracker(
+    student_name: str,
+    course_tag: str,
+    manager_name: str,
+    getcourse_id: str,
+    credentials_path: str = 'vipalina_google_credentials.json',
+    folder_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Быстрое создание трекера для студента.
+    
+    Args:
+        student_name: Имя студента
+        course_tag: Тег курса из GetCourse
+        manager_name: Имя VIP-менеджера
+        getcourse_id: ID из GetCourse
+        credentials_path: Путь к credentials файлу
+        folder_id: ID папки на Google Drive (опционально)
+    
+    Returns:
+        Dict с данными трекера
+    
+    Example:
+        result = create_student_tracker(
+            student_name="Иван Иванов",
+            course_tag="[python-ai-2.0] Тариф \"VIP\"",
+            manager_name="Марина Иванова",
+            getcourse_id="12345"
+        )
+        print(result['url'])
+    """
+    creator = TrackerCreator(credentials_path)
+    return creator.create_tracker(
+        student_name=student_name,
+        course_tag=course_tag,
+        manager_name=manager_name,
+        getcourse_id=getcourse_id,
+        parent_folder_id=folder_id
+    )
+
+
+# Пример использования
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    print("\n" + "="*60)
+    print("🚀 ТЕСТИРОВАНИЕ СОЗДАНИЯ ТРЕКЕРА")
+    print("="*60 + "\n")
+    
+    try:
+        result = create_student_tracker(
+            student_name="Тестовый Студент",
+            course_tag="[python-ai-2.0] Тариф \"VIP\"",
+            manager_name="Марина Иванова",
+            getcourse_id="TEST_" + str(int(datetime.now().timestamp()))
+        )
+        
+        print("\n" + "="*60)
+        print("✅ ТРЕКЕР УСПЕШНО СОЗДАН!")
+        print("="*60)
+        print(f"\n📊 URL: {result['url']}")
+        print(f"🆔 ID: {result['spreadsheet_id']}")
+        print(f"📝 Название: {result['title']}")
+        print(f"\n📚 Параметры курса:")
+        for key, value in result['course_params'].items():
+            print(f"   {key}: {value}")
+        print("\n" + "="*60 + "\n")
+        
+    except Exception as e:
+        print("\n" + "="*60)
+        print("❌ ОШИБКА!")
+        print("="*60)
+        print(f"\n{e}\n")
+        import traceback
+        traceback.print_exc()
+        print("\n" + "="*60 + "\n")

@@ -1,0 +1,67 @@
+# Environment variables - DO NOT COMMIT TO GIT
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+vipalina_env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+vipalina_logs/
+*.log
+
+# Session files
+*.session
+*.session-journal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Google credentials and OAuth tokens
+vipalina_google_credentials.json
+vipalina_google_service_account.json
+vipalina_google_oauth_client.json
+token_vipzerocoder.json
+
+# Telegram session strings
+.session_string.txt
+
+# Migration logs
+migration_*.log
+
+# Debug/internal JSON snapshots
+debug_about_info.json
+drive_about_info.json
+
+# Processed course data (local cache)
+vipalina_processed_courses/
+vipalina_course_index/
+vipalina_embeddings/
+vipalina_history/
+
+# Qoder internal
+.qoder/
+
+# Archived files with potential secrets
+_archived_cleanup_2026/
+
+# Backup files
+*.backup*
+*.bak
