@@ -1098,57 +1098,7 @@ name: {student_data.get('name') or '❌ Отсутствует'}
             except Exception as e:
                 logger.warning(f"⚠️ Первая попытка экспорта invite-ссылки не удалась: {e}. Повторим после назначения прав.")
             
-            # Шаг 1.5: Отправляем личное сообщение студенту ДО добавления в чат
-            # Используем номер телефона если есть, иначе username
-            try:
-                # Получаем entity для отправки ЛС
-                dm_entity = None
-                
-                # Приоритет 1: Номер телефона
-                if student_phone:
-                    try:
-                        dm_entity = await self.client.get_entity(student_phone)
-                        logger.info(f"✅ Entity получен по телефону: {student_phone}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Не удалось получить entity по телефону: {e}")
-                
-                # Приоритет 2: Username
-                if not dm_entity and student_telegram_username:
-                    try:
-                        dm_entity = await self.client.get_entity(student_telegram_username)
-                        logger.info(f"✅ Entity получен по username: {student_telegram_username}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Не удалось получить entity по username: {e}")
-                
-                # Отправляем ЛС если получили entity
-                if dm_entity:
-                    # Используем invite-ссылку если она есть, иначе формируем t.me/c/...
-                    if invite_link:
-                        chat_link = invite_link
-                    else:
-                        # Fallback: для ссылки на супергруппу нужно убрать префикс -100
-                        chat_link_id = str(chat_id).replace('-100', '') if str(chat_id).startswith('-100') else str(chat_id)
-                        chat_link = f"https://t.me/c/{chat_link_id}"
-                    
-                    invite_message = f"""🎓 Здравствуйте, {student_name}!
-
-Поздравляем с началом обучения в Zerocoder University! 🎉
-
-Для вас создан учебный чат с вашим персональным менеджером: {chat_link}
-
-Пожалуйста, принимайте приглашение в чат! 💚"""
-                    
-                    await self.client.send_message(dm_entity, invite_message)
-                    logger.info(f"✅ Личное сообщение отправлено студенту {student_name}")
-                    
-                    # Ждем 2 секунды чтобы сообщение доставилось
-                    import asyncio
-                    await asyncio.sleep(2)
-                else:
-                    logger.warning(f"⚠️ Не удалось получить entity для отправки ЛС студенту {student_name}")
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось отправить личное сообщение студенту: {e}")
+            # (ЛС студенту отправляется ПОСЛЕ получения invite-ссылки — см. ниже)
             
             # Шаг 2: Добавляем участников (студент, менеджер, бот)
             student_added = False
@@ -1438,6 +1388,59 @@ name: {student_data.get('name') or '❌ Отсутствует'}
                 except Exception as e:
                     logger.error(f"❌ Ошибка при второй попытке экспорта invite-ссылки: {e}")
             
+            # 📩 Отправляем ЛС студенту ВСЕГДА
+            # Если есть invite_link и студент не добавлен — шлём ссылку на чат
+            # Если invite_link нет или студент уже добавлен — шлём контакт менеджера
+            try:
+                dm_entity = None
+                
+                if student_phone:
+                    try:
+                        dm_entity = await self.client.get_entity(student_phone)
+                        logger.info(f"✅ Entity для ЛС получен по телефону: {student_phone}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Не удалось получить entity по телефону: {e}")
+                
+                if not dm_entity and student_telegram_username:
+                    try:
+                        dm_entity = await self.client.get_entity(student_telegram_username)
+                        logger.info(f"✅ Entity для ЛС получен по username: {student_telegram_username}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Не удалось получить entity по username: {e}")
+                
+                if dm_entity:
+                    manager_link = f"tg://user?id={manager_id}"
+                    
+                    if invite_link:
+                        # Есть ссылка — шлём invite + контакт менеджера
+                        invite_message = f"""🎓 Здравствуйте, {student_name}!
+
+Поздравляем с началом обучения в Zerocoder University! 🎉
+
+Для вас создан учебный чат с вашим персональным менеджером: {invite_link}
+
+Ваш VIP-менеджер — [{manager_name}]({manager_link}) 💚
+Пожалуйста, принимайте приглашение в чат!"""
+                    else:
+                        # Нет ссылки — шлём только контакт менеджера
+                        invite_message = f"""🎓 Здравствуйте, {student_name}!
+
+Поздравляем с началом обучения в Zerocoder University! 🎉
+
+Ваш персональный VIP-менеджер — [{manager_name}]({manager_link}).
+Напишите ей — вас добавят в учебный чат! 💚"""
+                    
+                    await self.client.send_message(dm_entity, invite_message)
+                    logger.info(f"✅ Личное сообщение отправлено студенту {student_name} (invite_link={'да' if invite_link else 'нет'})")
+                    
+                    import asyncio
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning(f"⚠️ Не удалось получить entity для ЛС студенту {student_name}")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось отправить ЛС студенту: {e}")
+            
             # 🧹 ШАГ FINAL: Удаляем студента из контактов (опционально)
             # Это очищает список контактов и скрывает факт добавления
             if student_user_id_from_contacts and student_added:
@@ -1533,8 +1536,7 @@ name: {student_data.get('name') or '❌ Отсутствует'}
 
 Добро пожаловать в Zerocoder University! 🌟
 
-Поздравляем с началом обучения на курсе:
-📚 {tracker_course_name}
+Поздравляем с началом обучения на курсе 📚
 
 Знакомьтесь — ваш персональный менеджер [{manager_name}](tg://user?id={manager_id})!
 Она будет сопровождать вас на протяжении всего обучения и поможет с любыми вопросами 💚

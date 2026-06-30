@@ -103,10 +103,12 @@ class TrackerCreator:
                         from google.auth.transport.requests import Request
                         logger.info("🔄 Попытка обновить истекший User OAuth токен...")
                         creds.refresh(Request())
-                        # Сохраняем обновленный токен
+                        # ВАЖНО: всегда сохраняем обновлённый токен обратно на диск,
+                        # иначе новый refresh_token теряется и следующий refresh упадёт с invalid_grant
                         with open(USER_OAUTH_TOKEN_PATH, 'w') as token_file:
                             token_file.write(creds.to_json())
-                        logger.info("✅ User OAuth токен успешно обновлен")
+                        self._creds = creds  # обновляем in-memory ссылку
+                        logger.info("✅ User OAuth токен успешно обновлен и сохранён на диск")
             except Exception as e:
                 error_msg = str(e)
                 logger.warning(f"⚠️ Не удалось авторизоваться через User OAuth: {error_msg}")
@@ -155,6 +157,47 @@ class TrackerCreator:
             raise
     
     def create_tracker(
+        self,
+        student_name: str,
+        course_tag: str,
+        manager_name: str,
+        getcourse_id: str,
+        parent_folder_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Создает трекер студента копированием шаблона.
+        
+        Args:
+            student_name: Имя студента (например, "Иван Иванов")
+            course_tag: Тег курса из GetCourse (например, "[python-ai-2.0] Тариф \"VIP\"")
+            manager_name: Имя VIP-менеджера
+            getcourse_id: ID из GetCourse
+            parent_folder_id: ID папки на Google Drive (опционально)
+        
+        Returns:
+            Dict с данными созданного трекера
+        """
+        # Внешний retry для всего create_tracker при ошибках квоты/сети
+        import time as _time
+        max_outer_retries = 3
+        for outer_attempt in range(max_outer_retries):
+            try:
+                return self._create_tracker_impl(
+                    student_name, course_tag, manager_name, getcourse_id, parent_folder_id
+                )
+            except Exception as e:
+                if _is_retryable_google_error(e) and outer_attempt < max_outer_retries - 1:
+                    wait = min(60, 10 * (outer_attempt + 1))
+                    logger.warning(
+                        f"⚠️ Ошибка создания трекера (попытка {outer_attempt+1}/{max_outer_retries}): {e}. "
+                        f"Жду {wait}с и повторяю..."
+                    )
+                    _time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("Не удалось создать трекер после всех попыток")
+
+    def _create_tracker_impl(
         self,
         student_name: str,
         course_tag: str,

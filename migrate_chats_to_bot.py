@@ -41,7 +41,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import (
     InviteToChannelRequest, EditAdminRequest, LeaveChannelRequest,
-    GetParticipantsRequest, EditCreatorRequest
+    GetParticipantsRequest
 )
 from telethon.tl.functions.account import GetPasswordRequest
 from telethon import password as telethon_password_utils
@@ -55,6 +55,69 @@ from telethon.errors import (
     FloodWaitError, UserNotMutualContactError, UserPrivacyRestrictedError,
     ChatAdminRequiredError, UserAlreadyParticipantError, ChannelPrivateError
 )
+
+
+# ---------------------------------------------------------------------------
+# Кастомный EditCreatorRequest — channels.editCreator#8f38fb1f
+# В Telethon 1.43.2 (layer 224) этот класс не сгенерирован,
+# но сервер Telegram всё ещё принимает этот метод.
+# Schema: channels.editCreator channel:InputChannel user_id:InputUser
+#          password:InputCheckPasswordSRP = Updates;
+# ---------------------------------------------------------------------------
+import struct
+from telethon.tl.tlobject import TLRequest
+
+
+class EditCreatorRequest(TLRequest):
+    CONSTRUCTOR_ID = 0x8f38cd1f
+    SUBCLASS_OF_ID = 0x8af52aac  # Updates
+
+    def __init__(self, channel, user_id, password):
+        """
+        :param channel: InputChannel
+        :param user_id: InputUser
+        :param password: InputCheckPasswordSRP
+        :returns Updates
+        """
+        self.channel = channel
+        self.user_id = user_id
+        self.password = password
+
+    async def resolve(self, client, utils):
+        self.channel = utils.get_input_channel(
+            await client.get_input_entity(self.channel))
+        self.user_id = utils.get_input_user(
+            await client.get_input_entity(self.user_id))
+
+    def to_dict(self):
+        return {
+            '_': 'EditCreatorRequest',
+            'channel': (self.channel.to_dict()
+                        if isinstance(self.channel, TLObject)
+                        else self.channel),
+            'user_id': (self.user_id.to_dict()
+                        if isinstance(self.user_id, TLObject)
+                        else self.user_id),
+            'password': (self.password.to_dict()
+                         if isinstance(self.password, TLObject)
+                         else self.password),
+        }
+
+    def _bytes(self):
+        return b''.join((
+            b'\x1f\xcd\x38\x8f',     # CONSTRUCTOR_ID 0x8f38cd1f LE
+            self.channel._bytes(),
+            self.user_id._bytes(),
+            self.password._bytes(),
+        ))
+
+    @classmethod
+    def from_reader(cls, reader):
+        _channel = reader.tgread_object()
+        _user_id = reader.tgread_object()
+        _password = reader.tgread_object()
+        return cls(channel=_channel, user_id=_user_id,
+                   password=_password)
 
 from config import (
     API_ID, API_HASH, TELETHON_BOT_TOKEN, ULTRALINA_BOT_USERNAME,
@@ -147,7 +210,7 @@ async def transfer_ownership(client, chat_id, new_owner_id, owner_name):
         return False
 
 
-async def main(dry_run: bool = False, limit: int = 0, offset: int = 0):
+async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_owner_error: bool = False):
     """Основная функция миграции."""
     
     # Прокси опциональный (на сервере через Tor, локально без прокси)
@@ -178,7 +241,14 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0):
     me = await client.get_me()
     my_id = me.id
     logger.info(f"✅ Userbot подключён (ID: {my_id})")
-    
+
+    # Прогреваем кэш сущностей (StringSession не хранит сущности)
+    logger.info("🔄 Прогрев диалогов для кэша сущностей...")
+    dialog_count = 0
+    async for dialog in client.iter_dialogs():
+        dialog_count += 1
+    logger.info(f"✅ Прогрето {dialog_count} диалогов")
+
     # Подключаем bot_client (для удаления сообщения "покинул группу" после выхода userbot)
     bot_client = TelegramClient(StringSession(), API_ID, API_HASH, proxy=proxy)
     await bot_client.start(bot_token=TELETHON_BOT_TOKEN)
@@ -255,21 +325,35 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0):
         
         # Проверяем, является ли userbot владельцем
         try:
+            entity = await client.get_entity(chat_id)
+            # Проверяем, что это супергруппа/канал (нужен InputChannel)
+            if not hasattr(entity, 'megagroup') and not hasattr(entity, 'broadcast'):
+                logger.info(f"  ⏭️ Пропускаем — не супергруппа {chat_id}")
+                skipped_not_owner.append(chat_id)
+                await asyncio.sleep(1)
+                continue
+            
             participants = await client(GetParticipantsRequest(
                 channel=chat_id, filter=ChannelParticipantsAdmins(),
                 offset=0, limit=50, hash=0
             ))
             is_owner = False
+            bot_in_chat = False
             for p in participants.participants:
                 if isinstance(p, ChannelParticipantCreator) and p.user_id == my_id:
                     is_owner = True
-                    break
+                if p.user_id == bot_entity.id:
+                    bot_in_chat = True
             
             if not is_owner:
                 logger.info(f"  ⏭️ Пропускаем — userbot не владелец чата {chat_id}")
                 skipped_not_owner.append(chat_id)
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 continue
+                
+            if bot_in_chat:
+                logger.info(f"  ℹ️ Бот уже в чате {chat_id} — только передача владения")
+                already_in += 1
         except Exception as check_e:
             logger.warning(f"  ⚠️ Не удалось проверить владение {chat_id}: {check_e}")
             errors.append((chat_id, f"Проверка владения: {check_e}"))
@@ -278,18 +362,22 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0):
             continue
         
         try:
-            # 1. Добавляем бота в чат
-            try:
-                await client(InviteToChannelRequest(
-                    channel=chat_id,
-                    users=[bot_entity]
-                ))
-                logger.info(f"  ✅ Бот добавлен в чат {chat_id}")
-            except UserAlreadyParticipantError:
-                logger.info(f"  ℹ️ Бот уже в чате {chat_id}")
-                already_in += 1
+            # 1. Добавляем бота в чат (если ещё не добавлен)
+            if not bot_in_chat:
+                try:
+                    await client(InviteToChannelRequest(
+                        channel=chat_id,
+                        users=[bot_entity]
+                    ))
+                    logger.info(f"  ✅ Бот добавлен в чат {chat_id}")
+                    await asyncio.sleep(2)  # Пауза после добавления
+                except UserAlreadyParticipantError:
+                    logger.info(f"  ℹ️ Бот уже в чате {chat_id}")
+                    already_in += 1
+            else:
+                logger.info(f"  ℹ️ Бот уже присутствует — пропускаем добавление")
             
-            # 2. Назначаем бота админом
+            # 2. Назначаем бота админом (если ещё не админ)
             bot_is_admin = False
             try:
                 await client(EditAdminRequest(
@@ -313,6 +401,12 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0):
                 if transferred:
                     ownership_transferred += 1
                     ownership_ok = True
+                else:
+                    # Передача прав ПРОВАЛИЛАСЬ — останавливаем если флаг установлен
+                    if stop_on_owner_error:
+                        logger.error(f"  🛑 СТОП: ошибка передачи прав для чата {chat_id}. Миграция прервана.")
+                        logger.info(f"\n  Прогресс до остановки: успешно={success}, передано={ownership_transferred}, ошибки={failed}")
+                        break
             else:
                 logger.info(f"  ℹ️ VIP-менеджер не найден среди админов — владение не передано")
             
@@ -428,6 +522,13 @@ if __name__ == "__main__":
     parser.add_argument('--dry-run', action='store_true', help='Не применять изменения, только показать что будет сделано')
     parser.add_argument('--limit', type=int, default=0, help='Ограничить количество чатов для обработки')
     parser.add_argument('--offset', type=int, default=0, help='Пропустить первые N чатов')
+    parser.add_argument('--stop-on-owner-error', action='store_true',
+                        help='Остановить миграцию при первой ошибке передачи прав владения')
     args = parser.parse_args()
     
-    asyncio.run(main(dry_run=args.dry_run, limit=args.limit, offset=args.offset))
+    asyncio.run(main(
+        dry_run=args.dry_run,
+        limit=args.limit,
+        offset=args.offset,
+        stop_on_owner_error=args.stop_on_owner_error
+    ))

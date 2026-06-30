@@ -104,7 +104,18 @@ class VipAutomationOrchestrator:
 
         # Создаем User Client для создания чатов и личных сообщений
         # Используем StringSession вместо файловой сессии (нет database lock!)
-        _client_kwargs = {'proxy': _proxy} if _proxy else {}
+        _client_kwargs = {
+            'proxy': _proxy,
+            'connection_retries': 10,
+            'retry_delay': 5,
+            'request_retries': 5,
+            'timeout': 30,
+        } if _proxy else {
+            'connection_retries': 10,
+            'retry_delay': 5,
+            'request_retries': 5,
+            'timeout': 30,
+        }
         session_string = os.getenv('TELETHON_SESSION_STRING')
         if session_string:
             logger.info("✅ Используем StringSession для Telethon client")
@@ -808,6 +819,16 @@ class VipAutomationOrchestrator:
                     # Передан код авторизации: /oauth КОД
                     code = parts[1].strip()
                     success, message = oauth_handler.exchange_code(sender_id, code)
+                    # ВАЖНО: перезагружаем credentials в TrackerCreator из нового файла на диске,
+                    # иначе он продолжает использовать старый in-memory токен до следующего рестарта
+                    if success and self.tracker_creator:
+                        try:
+                            await asyncio.to_thread(self.tracker_creator._authorize)
+                            logger.info("✅ TrackerCreator переавторизован с новым OAuth токеном")
+                            message += "\n\n🔄 TrackerCreator перезагружен с новым токеном."
+                        except Exception as reinit_err:
+                            logger.error(f"⚠️ Не удалось переавторизовать TrackerCreator: {reinit_err}")
+                            message += f"\n\n⚠️ Не удалось перезагрузить TrackerCreator: {reinit_err}"
                     await event.reply(message)
                 else:
                     # Генерируем URL авторизации
@@ -2136,7 +2157,10 @@ class VipAutomationOrchestrator:
                 
                 # Только для VIP-отдела
                 sender_id = event.sender_id
+                logger.info(f"📨 /help от пользователя {sender_id} в User Client")
                 if not self._is_vip_manager(sender_id):
+                    logger.warning(f"⚠️ /help отклонён: пользователь {sender_id} не найден среди сотрудников VIP-отдела")
+                    await event.reply("❌ У вас нет прав для выполнения этой команды.")
                     return
                 
                 help_text = (
@@ -2230,38 +2254,40 @@ class VipAutomationOrchestrator:
                         "Ручной запуск рассылки месячных планов\n"
                         "• Без параметра - всем студентам\n"
                         "• С номером (1/2/3) - группе по дню рассылки\n\n"
-
-                        "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
-
-                        "📈 **АНАЛИТИКА (только для руководителя):**\n\n"
-
-                        "📊 `/compare [месяц]`\n"
-                        "Сравнение менеджеров за месяц (напр. /compare 2025-06)\n"
-                        "Без параметра — текущий месяц\n\n"
-
-                        "🔄 `/retention [курс]`\n"
-                        "Удержание студентов по курсу на 30/60/90 дней\n"
-                        "Без аргумента — список курсов\n\n"
-
-                        "🏆 `/topactive`\n"
-                        "Топ-20 самых активных студентов за 30 дней\n\n"
-
-                        "📋 `/coursestats`\n"
-                        "Детальная статистика по курсам за текущий месяц\n\n"
-
-                        "🔒 `/stuck [статус] [N]`\n"
-                        "Студенты с неизменным статусом N+ месяцев подряд (по умолчанию 3)\n"
-                        "Доступные: Заморозка, Новый, Пропал, Выпускной, Модуль ОК, Учится...\n\n"
-
-                        "📉 `/kpidrop`\n"
-                        "Студенты, у которых KPI упал (✅→❌) по сравнению с прошлым месяцем\n\n"
-
-                        "🧟 `/nohw [N]`\n"
-                        "0 ДЗ за N месяцев подряд (зомби-студенты, по умолчанию 3 мес.)\n\n"
-
-                        "📊 `/managerload`\n"
-                        "Нагрузка менеджеров: каждый менеджер × кол-во студентов по статусам\n\n"
                     )
+                
+                help_text += (
+                    "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+
+                    "📈 **АНАЛИТИКА:**\n\n"
+
+                    "📊 `/compare [месяц]`\n"
+                    "Сравнение менеджеров за месяц (напр. /compare 2025-06)\n"
+                    "Без параметра — текущий месяц\n\n"
+
+                    "🔄 `/retention [курс]`\n"
+                    "Удержание студентов по курсу на 30/60/90 дней\n"
+                    "Без аргумента — список курсов\n\n"
+
+                    "🏆 `/topactive`\n"
+                    "Топ-20 самых активных студентов за 30 дней\n\n"
+
+                    "📋 `/coursestats`\n"
+                    "Детальная статистика по курсам за текущий месяц\n\n"
+
+                    "🔒 `/stuck [статус] [N]`\n"
+                    "Студенты с неизменным статусом N+ месяцев подряд (по умолчанию 3)\n"
+                    "Доступные: Заморозка, Новый, Пропал, Выпускной, Модуль ОК, Учится...\n\n"
+
+                    "📉 `/kpidrop`\n"
+                    "Студенты, у которых KPI упал (✅→❌) по сравнению с прошлым месяцем\n\n"
+
+                    "🧟 `/nohw [N]`\n"
+                    "0 ДЗ за N месяцев подряд (зомби-студенты, по умолчанию 3 мес.)\n\n"
+
+                    "📊 `/managerload`\n"
+                    "Нагрузка менеджеров: каждый менеджер × кол-во студентов по статусам\n\n"
+                )
                 
                 help_text += (
                     "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
@@ -2312,8 +2338,30 @@ class VipAutomationOrchestrator:
                     f"ℹ️ Активных чатов: {len(self.chat_to_student)}"
                 )
                 
-                await event.reply(help_text)
-                
+                max_message_length = 3500
+                if len(help_text) <= max_message_length:
+                    await event.reply(help_text, parse_mode='md')
+                    logger.info(f"✅ /help отправлен пользователю {sender_id} одним сообщением")
+                else:
+                    parts = help_text.split("➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n")
+                    current_part = ""
+                    sent_parts = 0
+
+                    for part in parts:
+                        separator = "" if not current_part else "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+                        candidate = current_part + separator + part
+                        if len(candidate) > max_message_length and current_part:
+                            await event.respond(current_part, parse_mode='md')
+                            sent_parts += 1
+                            current_part = part
+                        else:
+                            current_part = candidate
+
+                    if current_part:
+                        await event.respond(current_part, parse_mode='md')
+                        sent_parts += 1
+
+                    logger.info(f"✅ /help отправлен пользователю {sender_id} частями: {sent_parts}")
             except Exception as e:
                 logger.error(f"Ошибка при обработке /help: {e}", exc_info=True)
         
@@ -4304,6 +4352,15 @@ class VipAutomationOrchestrator:
                     # Передан код авторизации: /oauth КОД
                     code = parts[1].strip()
                     success, message = oauth_handler.exchange_code(sender_id, code)
+                    # ВАЖНО: перезагружаем credentials в TrackerCreator из нового файла на диске
+                    if success and self.tracker_creator:
+                        try:
+                            await asyncio.to_thread(self.tracker_creator._authorize)
+                            logger.info("✅ TrackerCreator переавторизован с новым OAuth токеном")
+                            message += "\n\n🔄 TrackerCreator перезагружен с новым токеном."
+                        except Exception as reinit_err:
+                            logger.error(f"⚠️ Не удалось переавторизовать TrackerCreator: {reinit_err}")
+                            message += f"\n\n⚠️ Не удалось перезагрузить TrackerCreator: {reinit_err}"
                     await event.reply(message)
                 else:
                     # Генерируем URL авторизации
@@ -6694,7 +6751,7 @@ class VipAutomationOrchestrator:
             if not self.sheets_integration:
                 return
             
-            missing_students = await self.sheets_integration.get_missing_students(days_threshold=30)
+            missing_students = await self.sheets_integration.get_missing_students(days_threshold=60)
             
             if not missing_students:
                 logger.info("Нет пропавших студентов для уведомления")
@@ -6713,7 +6770,7 @@ class VipAutomationOrchestrator:
             for manager_id, students in by_manager.items():
                 try:
                     message = "🔴 **ПРОПАВШИЕ СТУДЕНТЫ**\n\n"
-                    message += "Студенты, которые не писали более 30 дней:\n\n"
+                    message += "Студенты, которые не писали более 60 дней:\n\n"
                     
                     for s in students[:10]:  # Максимум 10 студентов в одном сообщении
                         message += f"👤 **{s['name']}**\n"
@@ -6913,8 +6970,23 @@ class VipAutomationOrchestrator:
                 raise
             
             # Авторизация Bot Client через токен бота (для inline-кнопок)
-            await self.bot_client.start(bot_token=TELETHON_BOT_TOKEN)
-            logger.info("✅ Bot Client запущен (@zerocoder_ultralina_bot)")
+            # Повторные попытки при нестабильном соединении через Tor
+            bot_started = False
+            for attempt in range(1, 6):
+                try:
+                    await self.bot_client.start(bot_token=TELETHON_BOT_TOKEN)
+                    bot_started = True
+                    logger.info(f"✅ Bot Client запущен (@zerocoder_ultralina_bot) с попытки {attempt}")
+                    break
+                except Exception as bot_err:
+                    logger.warning(f"⚠️ Попытка {attempt}/5 запуска Bot Client не удалась: {bot_err}")
+                    if attempt < 5:
+                        await asyncio.sleep(5 * attempt)
+                    else:
+                        raise
+            
+            if not bot_started:
+                raise RuntimeError("❌ Не удалось запустить Bot Client после 5 попыток")
             
             logger.info("Запущен клиент Telethon для автоматизации VIP-отдела")
             
@@ -7543,52 +7615,17 @@ async def main():
         try:
             with open(pid_file, 'r') as f:
                 old_pid = int(f.read().strip())
-            # Проверяем жив ли старый процесс
-            os.kill(old_pid, 0)  # signal 0 = проверка существования
-            # Процесс жив — убиваем его
-            print(f"⚠️ Обнаружен запущенный экземпляр (PID {old_pid}), убиваю...")
-            os.kill(old_pid, 9)
-            import time
-            time.sleep(1)
-        except (ProcessLookupError, ValueError, PermissionError):
+            if old_pid != my_pid:
+                os.kill(old_pid, 0)  # signal 0 = проверка существования
+                print(f"⚠️ Обнаружен запущенный экземпляр (PID {old_pid}), убиваю...")
+                os.kill(old_pid, 9)
+                import time
+                time.sleep(1)
+        except (ProcessLookupError, ValueError, PermissionError, OSError):
             pass  # Процесс мёртв или PID невалиден — продолжаем
     
     with open(pid_file, 'w') as f:
         f.write(str(my_pid))
-    
-    # PID-lock: гарантируем что работает только ОДИН экземпляр бота
-    import os as _os
-    _pid_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".vipalina.pid")
-    _my_pid = _os.getpid()
-    if _os.path.exists(_pid_file):
-        try:
-            with open(_pid_file, "r") as _f:
-                _old_pid = int(_f.read().strip())
-            _os.kill(_old_pid, 0)
-            print(f"⚠️ Обнаружен запущенный экземпляр (PID {_old_pid}), убиваю...")
-            _os.kill(_old_pid, 9)
-            import time; time.sleep(1)
-        except (ProcessLookupError, ValueError, PermissionError, OSError):
-            pass
-    with open(_pid_file, "w") as _f:
-        _f.write(str(_my_pid))
-    
-    # PID-lock: гарантируем что работает только ОДИН экземпляр бота
-    import os as _os
-    _pid_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".vipalina.pid")
-    _my_pid = _os.getpid()
-    if _os.path.exists(_pid_file):
-        try:
-            with open(_pid_file, "r") as _f:
-                _old_pid = int(_f.read().strip())
-            _os.kill(_old_pid, 0)
-            print(f"⚠️ Обнаружен запущенный экземпляр (PID {_old_pid}), убиваю...")
-            _os.kill(_old_pid, 9)
-            import time; time.sleep(1)
-        except (ProcessLookupError, ValueError, PermissionError, OSError):
-            pass
-    with open(_pid_file, "w") as _f:
-        _f.write(str(_my_pid))
     
     # Настройка логирования
     logging.basicConfig(

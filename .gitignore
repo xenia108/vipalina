@@ -1,3 +1,54 @@
+# Secrets & credentials
+.env
+*.session
+*.session-journal
+token_vipzerocoder.json
+vipalina_google_credentials.json
+vipalina_google_service_account.json
+vipalina_google_oauth_client.json
+
+# Debug JSON files (may contain sensitive data)
+debug_about_info.json
+drive_about_info.json
+
+# Logs
+vipalina_logs/
+*.log
+*.log.*
+
+# Runtime/temp files
+runtime_*
+*.txt.tmp
+.vipalina.pid
+*.pid
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.qoder/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+archived_broken_trackers/
+archived_empty_files/
+vipalina_history/
+vipalina_processed_courses/
 # Environment variables - DO NOT COMMIT TO GIT
 .env
 
