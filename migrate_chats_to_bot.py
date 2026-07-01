@@ -46,7 +46,7 @@ from telethon.tl.functions.channels import (
 from telethon.tl.functions.account import GetPasswordRequest
 from telethon import password as telethon_password_utils
 from telethon.tl.types import (
-    ChatAdminRights, ChannelParticipantAdmin, ChannelParticipantCreator,
+    ChatAdminRights,
     ChannelParticipantsAdmins, MessageService,
     MessageActionChatAddUser, MessageActionChatDeleteUser,
     MessageActionChatJoinedByLink, MessageActionChatEditTitle
@@ -139,20 +139,21 @@ EXCLUDED_OWNER_IDS = set(
 )
 
 
-async def find_vip_manager_in_chat(client, chat_id, my_id):
+async def find_vip_manager_in_chat(client, channel, my_id):
     """
     Находит VIP-менеджера среди админов чата.
-    Возвращает (user_id, name) или (None, None).
+    :param channel: InputChannel/Entity чата.
+    :returns (user_id, name) или (None, None).
     """
     try:
         result = await client(GetParticipantsRequest(
-            channel=chat_id,
+            channel=channel,
             filter=ChannelParticipantsAdmins(),
             offset=0,
             limit=50,
             hash=0
         ))
-        
+
         for participant in result.participants:
             uid = participant.user_id
             # Пропускаем себя (userbot), ботов, дежурных
@@ -169,7 +170,7 @@ async def find_vip_manager_in_chat(client, chat_id, my_id):
                         name = m['name']
                         break
                 return uid, name
-        
+
         # Если не нашли VIP-менеджера, ищем любого не-бота/не-дежурного админа
         for participant in result.participants:
             uid = participant.user_id
@@ -183,31 +184,43 @@ async def find_vip_manager_in_chat(client, chat_id, my_id):
                 continue
             name = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() if user_obj else "Неизвестный"
             return uid, name
-                
+
     except Exception as e:
-        logger.warning(f"  ⚠️ Не удалось получить список админов чата {chat_id}: {e}")
-    
+        logger.warning(f"  ⚠️ Не удалось получить список админов чата: {e}")
+
     return None, None
 
 
-async def transfer_ownership(client, chat_id, new_owner_id, owner_name):
+async def transfer_ownership(client, channel, new_owner_id, owner_name, max_retries: int = 1):
     """
     Передаёт владение чатом через EditCreatorRequest (требует 2FA).
-    Возвращает True при успехе.
+    :param channel: InputChannel/Entity чата.
+    :param max_retries: Количество повторных попыток при FloodWaitError.
+    :returns True при успехе.
     """
-    try:
-        pwd_settings = await client(GetPasswordRequest())
-        srp = telethon_password_utils.compute_check(pwd_settings, VIPALINA_2FA_PASSWORD)
-        await client(EditCreatorRequest(
-            channel=chat_id,
-            user_id=new_owner_id,
-            password=srp
-        ))
-        logger.info(f"  👑 Владение передано: {owner_name} (ID: {new_owner_id})")
-        return True
-    except Exception as e:
-        logger.warning(f"  ⚠️ Не удалось передать владение → {owner_name}: {e}")
-        return False
+    for attempt in range(max_retries + 1):
+        try:
+            pwd_settings = await client(GetPasswordRequest())
+            srp = telethon_password_utils.compute_check(pwd_settings, VIPALINA_2FA_PASSWORD)
+            await client(EditCreatorRequest(
+                channel=channel,
+                user_id=new_owner_id,
+                password=srp
+            ))
+            logger.info(f"  👑 Владение передано: {owner_name} (ID: {new_owner_id})")
+            return True
+        except FloodWaitError as e:
+            if attempt < max_retries:
+                logger.warning(f"  ⏳ FloodWait на передаче прав: ждём {e.seconds} сек...")
+                await asyncio.sleep(e.seconds + 2)
+                logger.info(f"  🔄 Повторная попытка передачи прав ({attempt + 2}/{max_retries + 1})")
+            else:
+                logger.warning(f"  ⚠️ Не удалось передать владение → {owner_name}: {e}")
+                return False
+        except Exception as e:
+            logger.warning(f"  ⚠️ Не удалось передать владение → {owner_name}: {e}")
+            return False
+    return False
 
 
 async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_owner_error: bool = False):
@@ -277,14 +290,40 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             except ValueError:
                 continue
     
-    logger.info(f"📊 Найдено {len(chat_ids)} учебных чатов для миграции")
+    logger.info(f"📊 Найдено {len(chat_ids)} учебных чатов в таблице Chat_To_Student")
+    
+    # Формируем множество для быстрого поиска
+    chat_ids_set = set(chat_ids)
+    
+    # Проходим по всем диалогам и находим чаты, где userbot является владельцем
+    # и которые есть в таблице Chat_To_Student.
+    # Это надёжнее, чем client.get_entity(chat_id), который не находит чаты вне кеша.
+    # Флаг entity.creator уже содержит информацию о создателе, избегая лишних
+    # запросов GetParticipantsRequest и связанных с ними FloodWait.
+    logger.info("🔍 Поиск чатов, где userbot является владельцем...")
+    chats_to_migrate = []
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+        # Только супергруппы
+        if not hasattr(entity, 'megagroup') or not entity.megagroup:
+            continue
+
+        # Формируем chat_id в формате -100XXXXXXXXXX
+        dialog_chat_id = -1000000000000 - entity.id
+        if dialog_chat_id not in chat_ids_set:
+            continue
+
+        if getattr(entity, 'creator', False):
+            chats_to_migrate.append((dialog_chat_id, entity))
+
+    logger.info(f"👑 Userbot является владельцем {len(chats_to_migrate)} чатов из таблицы")
     
     if offset > 0:
-        chat_ids = chat_ids[offset:]
+        chats_to_migrate = chats_to_migrate[offset:]
         logger.info(f"⏩ Пропущено первых {offset} чатов")
     
     if limit > 0:
-        chat_ids = chat_ids[:limit]
+        chats_to_migrate = chats_to_migrate[:limit]
         logger.info(f"🔒 Ограничено до {limit} чатов")
     
     if dry_run:
@@ -316,47 +355,27 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
     errors = []
     skipped_not_owner = []  # Чаты, где userbot не владелец
     
-    for i, chat_id in enumerate(chat_ids):
-        logger.info(f"[{i+1}/{len(chat_ids)}] Обработка чата {chat_id}...")
+    for i, (chat_id, entity) in enumerate(chats_to_migrate):
+        logger.info(f"[{i+1}/{len(chats_to_migrate)}] Обработка чата {chat_id}...")
         
         if dry_run:
             success += 1
             continue
         
-        # Проверяем, является ли userbot владельцем
+        # Проверяем, есть ли бот в чате
         try:
-            entity = await client.get_entity(chat_id)
-            # Проверяем, что это супергруппа/канал (нужен InputChannel)
-            if not hasattr(entity, 'megagroup') and not hasattr(entity, 'broadcast'):
-                logger.info(f"  ⏭️ Пропускаем — не супергруппа {chat_id}")
-                skipped_not_owner.append(chat_id)
-                await asyncio.sleep(1)
-                continue
-            
             participants = await client(GetParticipantsRequest(
-                channel=chat_id, filter=ChannelParticipantsAdmins(),
+                channel=entity, filter=ChannelParticipantsAdmins(),
                 offset=0, limit=50, hash=0
             ))
-            is_owner = False
-            bot_in_chat = False
-            for p in participants.participants:
-                if isinstance(p, ChannelParticipantCreator) and p.user_id == my_id:
-                    is_owner = True
-                if p.user_id == bot_entity.id:
-                    bot_in_chat = True
+            bot_in_chat = any(p.user_id == bot_entity.id for p in participants.participants)
             
-            if not is_owner:
-                logger.info(f"  ⏭️ Пропускаем — userbot не владелец чата {chat_id}")
-                skipped_not_owner.append(chat_id)
-                await asyncio.sleep(1)
-                continue
-                
             if bot_in_chat:
                 logger.info(f"  ℹ️ Бот уже в чате {chat_id} — только передача владения")
                 already_in += 1
         except Exception as check_e:
-            logger.warning(f"  ⚠️ Не удалось проверить владение {chat_id}: {check_e}")
-            errors.append((chat_id, f"Проверка владения: {check_e}"))
+            logger.warning(f"  ⚠️ Не удалось проверить админов {chat_id}: {check_e}")
+            errors.append((chat_id, f"Проверка админов: {check_e}"))
             failed += 1
             await asyncio.sleep(2)
             continue
@@ -366,7 +385,7 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             if not bot_in_chat:
                 try:
                     await client(InviteToChannelRequest(
-                        channel=chat_id,
+                        channel=entity,
                         users=[bot_entity]
                     ))
                     logger.info(f"  ✅ Бот добавлен в чат {chat_id}")
@@ -381,7 +400,7 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             bot_is_admin = False
             try:
                 await client(EditAdminRequest(
-                    channel=chat_id,
+                    channel=entity,
                     user_id=bot_entity,
                     admin_rights=admin_rights,
                     rank="Випалина"
@@ -395,9 +414,9 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             
             # 3. Находим VIP-менеджера и передаём владение
             ownership_ok = False
-            manager_id, manager_name = await find_vip_manager_in_chat(client, chat_id, my_id)
+            manager_id, manager_name = await find_vip_manager_in_chat(client, entity, my_id)
             if manager_id:
-                transferred = await transfer_ownership(client, chat_id, manager_id, manager_name)
+                transferred = await transfer_ownership(client, entity, manager_id, manager_name)
                 if transferred:
                     ownership_transferred += 1
                     ownership_ok = True
@@ -413,13 +432,13 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             # 4. Удаляем сервисные сообщения (пригласил/вышел/вступил)
             try:
                 service_msg_ids = []
-                async for msg in client.iter_messages(chat_id, limit=100):
+                async for msg in client.iter_messages(entity, limit=100):
                     if isinstance(msg, MessageService):
                         action = msg.action
                         if isinstance(action, (MessageActionChatAddUser, MessageActionChatDeleteUser, MessageActionChatJoinedByLink)):
                             service_msg_ids.append(msg.id)
                 if service_msg_ids:
-                    await client.delete_messages(chat_id, service_msg_ids)
+                    await client.delete_messages(entity, service_msg_ids)
                     logger.info(f"  🧹 Удалено {len(service_msg_ids)} сервисных сообщений")
             except Exception as clean_e:
                 logger.warning(f"  ⚠️ Не удалось очистить сервисные сообщения: {clean_e}")
@@ -430,10 +449,10 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             else:
                 try:
                     # Запоминаем ID последнего сообщения перед выходом
-                    last_msg = (await client.get_messages(chat_id, limit=1))[0]
+                    last_msg = (await client.get_messages(entity, limit=1))[0]
                     last_msg_id = last_msg.id if last_msg else 0
                     
-                    await client(LeaveChannelRequest(channel=chat_id))
+                    await client(LeaveChannelRequest(channel=entity))
                     left_chats += 1
                     logger.info(f"  🚪 Userbot покинул чат {chat_id}")
                     
@@ -442,7 +461,7 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
                         try:
                             await asyncio.sleep(1)
                             leave_msg_id = last_msg_id + 1
-                            await bot_client.delete_messages(chat_id, [leave_msg_id])
+                            await bot_client.delete_messages(entity, [leave_msg_id])
                             logger.info(f"  🧹 Удалено сообщение 'покинул группу' (ID: {leave_msg_id})")
                         except Exception as bot_clean_e:
                             logger.warning(f"  ⚠️ Bot не смог удалить сообщение о выходе: {bot_clean_e}")
@@ -454,20 +473,20 @@ async def main(dry_run: bool = False, limit: int = 0, offset: int = 0, stop_on_o
             logger.warning(f"  ⏳ FloodWait: ждём {e.seconds} сек...")
             await asyncio.sleep(e.seconds + 1)
             try:
-                await client(InviteToChannelRequest(channel=chat_id, users=[bot_entity]))
+                await client(InviteToChannelRequest(channel=entity, users=[bot_entity]))
                 await client(EditAdminRequest(
-                    channel=chat_id, user_id=bot_entity,
+                    channel=entity, user_id=bot_entity,
                     admin_rights=admin_rights, rank="Випалина"
                 ))
                 success += 1
                 # Передача владения при retry
-                manager_id, manager_name = await find_vip_manager_in_chat(client, chat_id, my_id)
+                manager_id, manager_name = await find_vip_manager_in_chat(client, entity, my_id)
                 if manager_id:
-                    if await transfer_ownership(client, chat_id, manager_id, manager_name):
+                    if await transfer_ownership(client, entity, manager_id, manager_name):
                         ownership_transferred += 1
                 # Выход
                 try:
-                    await client(LeaveChannelRequest(channel=chat_id))
+                    await client(LeaveChannelRequest(channel=entity))
                     left_chats += 1
                 except:
                     pass
