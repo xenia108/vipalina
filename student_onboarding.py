@@ -35,6 +35,28 @@ from entity_cache import EntityCache
 
 logger = logging.getLogger('vipalina_telethon')
 
+# Тип операции для отложенной передачи владения (используется StateManager)
+OWNERSHIP_TRANSFER_OP_TYPE = "ownership_transfer"
+
+
+def _is_retryable_ownership_error(e: Exception) -> bool:
+    """
+    Определяет, является ли ошибка передачи владения временной и требует повторной попытки позже.
+    Основная причина на свежих сессиях: Telegram требует cooldown (~15000 сек) для EditCreatorRequest.
+    """
+    err_text = str(e).lower()
+    if isinstance(e, FloodWaitError):
+        return True
+    if "session logged in too recently" in err_text:
+        return True
+    if "too many requests" in err_text:
+        return True
+    if "flood" in err_text:
+        return True
+    if "wait" in err_text and "seconds" in err_text:
+        return True
+    return False
+
 
 class StudentDataValidationError(Exception):
     """Исключение для ошибок валидации данных студента"""
@@ -278,6 +300,132 @@ class StudentOnboardingModule:
                 manager_id,
                 manager_name
             )
+    
+    async def _execute_ownership_transfer(
+        self,
+        chat_id: int,
+        target_id: int,
+        target_label: str
+    ) -> tuple:
+        """
+        Выполняет передачу владения чатом target_id через EditCreatorRequest.
+        Возвращает (success: bool, retryable: bool).
+        """
+        try:
+            from config import VIPALINA_2FA_PASSWORD
+            from telethon.tl.functions.account import GetPasswordRequest
+            from telethon import password as telethon_password_utils
+            from telethon.tl.functions.channels import EditCreatorRequest
+
+            pwd_settings = await self.client(GetPasswordRequest())
+            srp = telethon_password_utils.compute_check(pwd_settings, VIPALINA_2FA_PASSWORD)
+            await self.client(EditCreatorRequest(
+                channel=chat_id,
+                user_id=target_id,
+                password=srp
+            ))
+            logger.info(f"✅ Владение чатом {chat_id} передано: {target_label}")
+            return True, False
+        except Exception as ex:
+            retryable = _is_retryable_ownership_error(ex)
+            logger.warning(
+                f"⚠️ Не удалось передать владение чатом {chat_id} → {target_label}: {ex} "
+                f"({'временная ошибка, будет повторена позже' if retryable else 'фатальная ошибка'})"
+            )
+            return False, retryable
+    
+    async def _leave_chat_after_transfer(self, chat_id: int) -> bool:
+        """
+        Userbot покидает чат после успешной передачи владения.
+        Удаляет системное сообщение о выходе через bot_client, если доступен.
+        """
+        try:
+            from telethon.tl.functions.channels import LeaveChannelRequest
+            import asyncio as _asyncio
+
+            last_msg = (await self.client.get_messages(chat_id, limit=1))[0]
+            last_msg_id = last_msg.id if last_msg else 0
+
+            await self.client(LeaveChannelRequest(channel=chat_id))
+            logger.info(f"🚪 Userbot покинул чат {chat_id} (владение передано)")
+
+            if last_msg_id and hasattr(self, 'bot_client') and self.bot_client:
+                try:
+                    await _asyncio.sleep(1)
+                    leave_msg_id = last_msg_id + 1
+                    await self.bot_client.delete_messages(chat_id, [leave_msg_id])
+                    logger.info(f"🗑 Удалено системное сообщение о выходе из чата {chat_id}")
+                except Exception as del_e:
+                    logger.warning(f"⚠️ Не удалось удалить сообщение о выходе: {del_e}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось покинуть чат {chat_id}: {e}")
+            return False
+    
+    async def process_pending_ownership_transfers(self):
+        """
+        Обрабатывает отложенные операции передачи владения из StateManager.
+        Вызывается из фонового цикла VipAutomationOrchestrator.
+        """
+        if not self.state_manager:
+            return
+
+        try:
+            ownership_ops = await self.state_manager.get_pending_operations_by_type(OWNERSHIP_TRANSFER_OP_TYPE)
+
+            if not ownership_ops:
+                return
+
+            logger.info(f"🔄 Обработка {len(ownership_ops)} отложенных передач владения...")
+
+            for op in ownership_ops:
+                operation_id = op['id']
+                data = op.get('data', {})
+                chat_id = data.get('chat_id')
+                target_id = data.get('target_id')
+                target_label = data.get('target_label', 'VIP-менеджер')
+                fallback_target_id = data.get('fallback_target_id')
+                fallback_target_label = data.get('fallback_target_label', 'Изумрудный Дежурный')
+
+                if not chat_id or not target_id:
+                    logger.warning(f"⚠️ Операция {operation_id} повреждена, пропускаем")
+                    await self.state_manager.update_operation_status(operation_id, 'failed', error='Missing chat_id or target_id')
+                    continue
+
+                await self.state_manager.update_operation_status(operation_id, 'in_progress')
+
+                success, retryable = await self._execute_ownership_transfer(chat_id, target_id, target_label)
+
+                if not success and fallback_target_id:
+                    logger.info(f"🔄 Fallback: пробуем передать владение чатом {chat_id} → {fallback_target_label}")
+                    success, retryable = await self._execute_ownership_transfer(
+                        chat_id, fallback_target_id, fallback_target_label
+                    )
+
+                if success:
+                    await self._leave_chat_after_transfer(chat_id)
+                    await self.state_manager.update_operation_status(operation_id, 'completed')
+                elif retryable:
+                    await self.state_manager.update_operation_status(
+                        operation_id,
+                        'pending',
+                        error='Cooldown/session too recent, will retry later',
+                        increment_retry=True
+                    )
+                else:
+                    await self.state_manager.update_operation_status(
+                        operation_id,
+                        'failed',
+                        error='Non-retryable error during ownership transfer',
+                        increment_retry=True
+                    )
+
+                # Небольшая задержка между операциями, чтобы не спровоцировать FloodWait
+                import asyncio as _asyncio
+                await _asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в process_pending_ownership_transfers: {e}", exc_info=True)
     
     async def _onboard_student_with_rollback(
         self,
@@ -1333,9 +1481,12 @@ name: {student_data.get('name') or '❌ Отсутствует'}
                 except Exception as e:
                     logger.warning(f"Не удалось назначить Руководителя VIP-отдела администратором: {e}")
             
-            # === ПЕРЕДАЧА ВЛАДЕНИЯ ЧАТОМ (с fallback) ===
+            # === ПЕРЕДАЧА ВЛАДЕНИЯ ЧАТОМ (с fallback и отложенной повторной попыткой) ===
             async def _try_transfer_ownership(target_id, label):
-                """Попытка передать владение чатом. Возвращает True при успехе."""
+                """
+                Попытка передать владение чатом.
+                Возвращает кортеж (success: bool, retryable: bool).
+                """
                 try:
                     from config import VIPALINA_2FA_PASSWORD
                     pwd_settings = await self.client(GetPasswordRequest())
@@ -1346,22 +1497,62 @@ name: {student_data.get('name') or '❌ Отсутствует'}
                         password=srp
                     ))
                     logger.info(f"✅ Владение чатом {chat_id} передано: {label}")
-                    return True
+                    return True, False
                 except Exception as ex:
-                    logger.warning(f"⚠️ Не удалось передать владение → {label}: {ex}")
-                    return False
+                    retryable = _is_retryable_ownership_error(ex)
+                    logger.warning(
+                        f"⚠️ Не удалось передать владение → {label}: {ex} "
+                        f"({'временная ошибка, будет повторена позже' if retryable else 'фатальная ошибка'})"
+                    )
+                    return False, retryable
 
             ownership_transferred = False
-            # Попытка 1: передать менеджеру
-            ownership_transferred = await _try_transfer_ownership(manager_id, f"менеджер {manager_name}")
-            # Попытка 2: передать Изумрудному Дежурному
-            if not ownership_transferred and black_duty_entity:
-                ownership_transferred = await _try_transfer_ownership(
-                    black_duty_account['telegram_id'],
-                    f"Изумрудный Дежурный ({black_duty_account['name']})"
+            any_retryable = False
+            target_candidates = [
+                (manager_id, f"менеджер {manager_name}"),
+            ]
+            if black_duty_entity:
+                target_candidates.append(
+                    (black_duty_account['telegram_id'], f"Изумрудный Дежурный ({black_duty_account['name']})")
                 )
+
+            for target_id, label in target_candidates:
+                success, retryable = await _try_transfer_ownership(target_id, label)
+                any_retryable = any_retryable or retryable
+                if success:
+                    ownership_transferred = True
+                    break
+
             if not ownership_transferred:
-                logger.info(f"ℹ️ Владелец чата {chat_id}: Випалина (передача не удалась)")
+                if any_retryable and self.state_manager:
+                    # Сохраняем операцию для отложенной передачи владения
+                    best_target_id = target_candidates[0][0]
+                    best_target_label = target_candidates[0][1]
+                    operation_id = f"ownership_{chat_id}_{int(datetime.now().timestamp())}"
+                    saved = await self.state_manager.save_operation(
+                        operation_id=operation_id,
+                        operation_type=OWNERSHIP_TRANSFER_OP_TYPE,
+                        data={
+                            'chat_id': chat_id,
+                            'target_id': best_target_id,
+                            'target_label': best_target_label,
+                            'student_name': student_name,
+                            'manager_id': manager_id,
+                            'manager_name': manager_name,
+                            'fallback_target_id': black_duty_account['telegram_id'] if black_duty_entity else None,
+                            'fallback_target_label': f"Изумрудный Дежурный ({black_duty_account['name']})" if black_duty_entity else None,
+                        },
+                        status='pending'
+                    )
+                    if saved:
+                        logger.info(
+                            f"📋 Владение чатом {chat_id} запланировано для повторной передачи позже "
+                            f"(когда пройдет cooldown Telegram). Цель: {best_target_label}"
+                        )
+                    else:
+                        logger.error(f"❌ Не удалось сохранить операцию передачи владения для чата {chat_id}")
+                else:
+                    logger.info(f"ℹ️ Владелец чата {chat_id}: Випалина (передача не удалась)")
 
             # Итоговые роли в супергруппе:
             # - Владелец: Менеджер (при успехе) → Изумрудный Дежурный → Випалина (fallback)

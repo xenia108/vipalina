@@ -53,6 +53,7 @@ from info_updater import setup_info_updater
 
 # Модуль персистенции - сохраняет все runtime-состояние в Google Sheets
 from vipalina_persistence import get_persistence, VipalinaPersistence
+from state_manager import StateManager
 
 # Модули касаний и напоминаний
 from touch_buttons_handler import setup_touch_buttons_handler
@@ -134,12 +135,19 @@ class VipAutomationOrchestrator:
             logger.warning("⚠️ BOT_SESSION_STRING не найден, используем файловую сессию")
             self.bot_client = TelegramClient('bot_session', API_ID, API_HASH, **_client_kwargs)
         
+        # Инициализация State Manager для отложенных операций (например, передачи владения)
+        self.state_manager = StateManager()
+        
         # Инициализация модулей
         # ManagerQueue использует bot_client для отправки кнопок
         self.manager_queue = ManagerQueue(self.bot_client)
         # Остальные модули используют user client для создания чатов
         self.chat_monitor = VIPChatMonitor(self.client)
-        self.onboarding_module = StudentOnboardingModule(self.client, bot_client=self.bot_client)
+        self.onboarding_module = StudentOnboardingModule(
+            self.client,
+            bot_client=self.bot_client,
+            state_manager=self.state_manager
+        )
         
         # Кеш entities - используем из onboarding_module для единообразия
         self.entity_cache = self.onboarding_module.entity_cache
@@ -6931,6 +6939,29 @@ class VipAutomationOrchestrator:
                 logger.error(f"Ошибка в цикле проверки пропавших: {e}", exc_info=True)
                 await asyncio.sleep(60)
     
+    async def _ownership_transfer_loop(self):
+        """
+        Фоновый цикл отложенной передачи владения чатами VIP-менеджерам.
+        Telegram блокирует EditCreatorRequest на свежей сессии (~4 часа),
+        поэтому неудавшиеся передачи ставятся в очередь и обрабатываются здесь.
+        Проверяет очередь каждые 10 минут.
+        """
+        logger.info("🔄 Фоновый цикл передачи владения запущен (проверка каждые 10 минут)")
+        
+        while True:
+            try:
+                if self.onboarding_module and hasattr(self.onboarding_module, 'process_pending_ownership_transfers'):
+                    await self.onboarding_module.process_pending_ownership_transfers()
+                else:
+                    logger.warning("⚠️ Onboarding module не инициализирован, пропускаем цикл передачи владения")
+                
+                # Ждём 10 минут перед следующей проверкой
+                await asyncio.sleep(600)
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка в цикле передачи владения: {e}", exc_info=True)
+                await asyncio.sleep(60)
+    
     async def run(self):
         """Запускает основной цикл бота"""
         try:
@@ -6990,12 +7021,25 @@ class VipAutomationOrchestrator:
             
             logger.info("Запущен клиент Telethon для автоматизации VIP-отдела")
             
+            # Инициализируем State Manager для отложенных операций
+            try:
+                logger.info("📊 Инициализация State Manager...")
+                await self.state_manager.initialize()
+                logger.info("✅ State Manager инициализирован")
+            except Exception as sm_err:
+                logger.error(f"❌ Не удалось инициализировать State Manager: {sm_err}", exc_info=True)
+                # Не прерываем запуск, но отложенные операции работать не будут
+            
             # Запускаем оркестратор
             await self.start()
             
             # Запускаем периодическую проверку пропавших студентов
             asyncio.create_task(self._missing_students_check_loop())
             logger.info("✅ Запущена ежедневная проверка пропавших студентов (10:00 МСК)")
+            
+            # Запускаем фоновый цикл отложенной передачи владения чатами
+            asyncio.create_task(self._ownership_transfer_loop())
+            logger.info("✅ Запущен фоновый цикл отложенной передачи владения (каждые 10 минут)")
             
             # Запускаем планировщик рассылки месячных планов
             # АВТОМАТИЧЕСКАЯ РАССЫЛКА ОТКЛЮЧЕНА - только ручной запуск через /sendmonthlyplans

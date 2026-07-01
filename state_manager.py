@@ -270,6 +270,49 @@ class StateManager:
             logger.error(f"Ошибка при поиске операции {operation_id}: {e}")
             return None
     
+    async def get_pending_operations_by_type(self, operation_type: str) -> List[Dict[str, Any]]:
+        """
+        Возвращает pending/in_progress операции указанного типа из Google Sheets.
+        НЕ перезаписывает локальный кеш (в отличие от restore_pending_operations).
+        """
+        try:
+            all_data = await AsyncSheetsWrapper.run_sync(
+                self.worksheet.get_all_values
+            )
+            
+            if len(all_data) <= 1:
+                return []
+            
+            pending_ops = []
+            
+            for row in all_data[1:]:  # Пропускаем заголовки
+                if len(row) < 4:
+                    continue
+                
+                if row[1] != operation_type:
+                    continue
+                
+                status = row[2]
+                if status not in ['pending', 'in_progress']:
+                    continue
+                
+                try:
+                    data = json.loads(row[3])
+                    pending_ops.append({
+                        'id': row[0],
+                        'type': operation_type,
+                        'data': data,
+                        'status': status
+                    })
+                except json.JSONDecodeError:
+                    logger.error(f"Не удалось декодировать данные операции {row[0]}")
+            
+            return pending_ops
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении операций типа {operation_type}: {e}", exc_info=True)
+            return []
+    
     async def restore_pending_operations(self) -> List[Dict[str, Any]]:
         """
         Восстанавливает незавершенные операции после рестарта.
