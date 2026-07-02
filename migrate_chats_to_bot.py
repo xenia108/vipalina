@@ -129,8 +129,19 @@ from config import (
 # Собираем ID всех VIP-менеджеров (для поиска владельца)
 ALL_VIP_MANAGER_IDS = set(
     [m['telegram_id'] for m in VIP_MANAGERS_VIP] +
-    [m['telegram_id'] for m in VIP_MANAGERS_LUXURY]
+    [m['telegram_id'] for m in VIP_MANAGERS_LUXURY] +
+    # Дополнительные аккаунты менеджеров, встречающиеся в старых чатах
+    [6323266269, 7692022284]
 )
+
+# Имена для дополнительных fallback-менеджеров
+FALLBACK_MANAGER_NAMES = {
+    6323266269: "zero_vip_manager",
+    7692022284: "vip_zerocoder",
+}
+
+# ID дежурных аккаунтов, которым можно передать владение как крайняя мера
+DUTY_OWNER_IDS = {6323266269, 7692022284}
 
 # ID, которым НЕ передаём владение (дежурные, руководитель, боты)
 EXCLUDED_OWNER_IDS = set(
@@ -139,9 +150,21 @@ EXCLUDED_OWNER_IDS = set(
 )
 
 
+def _resolve_manager_name(uid):
+    """Возвращает имя менеджера по ID."""
+    name = FALLBACK_MANAGER_NAMES.get(uid)
+    if name:
+        return name
+    for m in VIP_MANAGERS_VIP + VIP_MANAGERS_LUXURY:
+        if m['telegram_id'] == uid:
+            return m['name']
+    return "VIP-менеджер"
+
+
 async def find_vip_manager_in_chat(client, channel, my_id):
     """
-    Находит VIP-менеджера среди админов чата.
+    Находит подходящего владельца среди админов чата.
+    Сначала ищет обычного VIP-менеджера, затем дежурного аккаунта как fallback.
     :param channel: InputChannel/Entity чата.
     :returns (user_id, name) или (None, None).
     """
@@ -154,36 +177,36 @@ async def find_vip_manager_in_chat(client, channel, my_id):
             hash=0
         ))
 
+        # 1. Сначала ищем обычного VIP-менеджера (не дежурного)
         for participant in result.participants:
             uid = participant.user_id
-            # Пропускаем себя (userbot), ботов, дежурных
             if uid == my_id:
                 continue
             if uid in EXCLUDED_OWNER_IDS:
                 continue
-            # Ищем VIP-менеджера
-            if uid in ALL_VIP_MANAGER_IDS:
-                # Найдём имя
-                name = "VIP-менеджер"
-                for m in VIP_MANAGERS_VIP + VIP_MANAGERS_LUXURY:
-                    if m['telegram_id'] == uid:
-                        name = m['name']
-                        break
-                return uid, name
+            if uid in ALL_VIP_MANAGER_IDS and uid not in DUTY_OWNER_IDS:
+                return uid, _resolve_manager_name(uid)
 
-        # Если не нашли VIP-менеджера, ищем любого не-бота/не-дежурного админа
+        # 2. Fallback: любой не-бот/не-дежурный/не-userbot админ
         for participant in result.participants:
             uid = participant.user_id
             if uid == my_id:
                 continue
             if uid in EXCLUDED_OWNER_IDS:
                 continue
-            # Пропускаем ботов (ID ботов обычно > 8000000000 или имеют bot flag)
             user_obj = next((u for u in result.users if u.id == uid), None)
             if user_obj and user_obj.bot:
                 continue
             name = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() if user_obj else "Неизвестный"
             return uid, name
+
+        # 3. Крайняя мера: дежурный аккаунт, если никого другого нет
+        for participant in result.participants:
+            uid = participant.user_id
+            if uid == my_id:
+                continue
+            if uid in DUTY_OWNER_IDS:
+                return uid, _resolve_manager_name(uid)
 
     except Exception as e:
         logger.warning(f"  ⚠️ Не удалось получить список админов чата: {e}")
